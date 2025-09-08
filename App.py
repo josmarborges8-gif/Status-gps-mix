@@ -1,7 +1,8 @@
 # app.py
-# Status GPS - MIX — deploy na Streamlit Cloud usando SharePoint como fonte
+# Status GPS - MIX — atualização automática por ETag/Last-Modified (SharePoint) + data sem horário
 
 import os
+import json
 import shutil
 from urllib.parse import urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
 from datetime import datetime
@@ -18,8 +19,10 @@ import plotly.express as px
 st.set_page_config(page_title="Status GPS - MIX", layout="wide")
 
 ARQUIVO = Path("STATUS_GPS.xlsx")
+META = Path("STATUS_GPS.meta.json")  # guarda ETag/Last-Modified
+AUTO_CHECK_MINUTES = 60              # intervalo da checagem automática
 
-# Seu link do SharePoint (padrão). Eu adiciono ?download=1 abaixo.
+# Seu link do SharePoint (padrão). Certifique-se de compartilhar como "Qualquer pessoa com o link – Visualizador".
 DATA_URL_DEFAULT = (
     "https://grupoecorodovias-my.sharepoint.com/:x:/g/personal/"
     "josmar_silva_ecovias_com_br/ES2Gw9BPByRMkK9prUwHzkkBUFcNUIfCWXN-sQfaaElF5A"
@@ -109,7 +112,7 @@ def _strip_quotes(s: str) -> str:
     return s.strip().strip('"').strip("'")
 
 def _ensure_download_param(url: str) -> str:
-    """Garante que o link do SharePoint/OneDrive tenha download=1."""
+    """Garante ?download=1 em links do OneDrive/SharePoint."""
     try:
         p = urlsplit(url)
         q = dict(parse_qsl(p.query))
@@ -120,63 +123,129 @@ def _ensure_download_param(url: str) -> str:
         return url if ("download=" in url) else (url + ("&" if "?" in url else "?") + "download=1")
 
 def get_data_url() -> str:
-    # prioridade: Secrets > env > padrão embutido
     raw = st.secrets.get("DATA_URL", os.getenv("DATA_URL", DATA_URL_DEFAULT))
     url = _strip_quotes(str(raw))
     return _ensure_download_param(url) if url else ""
 
-def format_dt(dt: datetime) -> str:
-    return dt.strftime("%d/%m/%Y %H:%M") if isinstance(dt, datetime) else "-"
+def format_dt_only_date(dt: datetime) -> str:
+    """Só a data (dd/mm/aaaa)."""
+    return dt.strftime("%d/%m/%Y") if isinstance(dt, datetime) else "-"
 
 def _is_http(url: str) -> bool:
     try:
-        s = urlparse(url).scheme.lower()
-        return s in ("http", "https")
+        return urlparse(url).scheme.lower() in ("http", "https")
     except Exception:
         return False
 
-def baixar_fonte(src: str, destino: Path, timeout: int = 60) -> str:
-    """Baixa/copia a fonte para ARQUIVO. Valida se não veio página de login."""
-    src = _strip_quotes(src)
-    if _is_http(src):
-        headers = {"User-Agent": "Mozilla/5.0 (StreamlitApp)"}
-        r = requests.get(src, timeout=timeout, headers=headers, allow_redirects=True)
-        r.raise_for_status()
-        # Proteção: SharePoint às vezes entrega HTML de login
-        ctype = r.headers.get("Content-Type", "").lower()
-        if "text/html" in ctype or r.content[:200].lstrip().startswith(b"<!DOCTYPE html"):
-            raise RuntimeError(
-                "O link do SharePoint não é de download direto ou exige login. "
-                "Abra o arquivo em 'Compartilhar' e gere um link 'Qualquer pessoa com o link - Visualizador', "
-                "depois use esse link com download=1."
-            )
-        destino.write_bytes(r.content)
-        return "baixada por URL"
-    # Caminho local/UNC (útil fora da Cloud)
-    p = Path(src)
-    if not p.exists():
-        raise FileNotFoundError(f"Fonte local não encontrada: {p}")
-    if p.resolve() != destino.resolve():
-        shutil.copy2(p, destino)
-        return "copiada de caminho local"
-    return "arquivo já é a própria fonte"
+def _load_meta() -> dict:
+    if META.exists():
+        try:
+            return json.loads(META.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
 
-def needs_daily_update(p: Path) -> bool:
-    if not p.exists():
+def _save_meta(meta: dict):
+    try:
+        META.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def _remote_head(url: str) -> tuple[dict, int]:
+    """Tenta HEAD; se não suportar, tenta GET de 1 byte (range). Retorna (headers, status_code)."""
+    headers_common = {"User-Agent": "Mozilla/5.0 (StreamlitApp)"}
+    try:
+        r = requests.head(url, timeout=30, allow_redirects=True, headers=headers_common)
+        if r.status_code < 400 and r.headers:
+            return r.headers, r.status_code
+    except Exception:
+        pass
+    # Fallback: GET 1 byte
+    try:
+        h = headers_common | {"Range": "bytes=0-0"}
+        r = requests.get(url, timeout=30, allow_redirects=True, headers=h, stream=True)
+        return r.headers, r.status_code
+    except Exception as e:
+        raise e
+
+def _content_looks_excel(headers: dict, content_first_bytes: bytes) -> bool:
+    ctype = (headers or {}).get("Content-Type", "").lower()
+    if "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" in ctype:
         return True
-    return datetime.fromtimestamp(p.stat().st_mtime).date() < datetime.now().date()
+    # fallback: arquivo .xlsx (zip) começa com bytes 'PK'
+    return content_first_bytes.startswith(b"PK")
 
-def atualizar_base_se_preciso(DATA_URL: str, force: bool = False, destino: Path | None = None):
-    destino = destino or ARQUIVO
+def download_if_changed(url: str, destino: Path) -> str:
+    """Baixa apenas se ETag/Last-Modified mudarem. Salva META com infos."""
+    if not _is_http(url):
+        # caminho local/UNC
+        p = Path(url)
+        if not p.exists():
+            raise FileNotFoundError(f"Fonte local não encontrada: {p}")
+        if p.resolve() != destino.resolve():
+            shutil.copy2(p, destino)
+            _save_meta({"source": str(p), "local_copy_mtime": datetime.now().isoformat()})
+            return "copiada de caminho local"
+        return "arquivo já é a própria fonte"
+
+    meta = _load_meta()
+    etag_prev = meta.get("etag")
+    lastmod_prev = meta.get("last_modified")
+
+    # 1) Checa cabeçalhos remotos
+    headers, _ = _remote_head(url)
+    etag_new = headers.get("ETag") or headers.get("Etag") or headers.get("etag")
+    lastmod_new = headers.get("Last-Modified") or headers.get("last-modified")
+
+    # 2) Se nada mudou, não baixa
+    if etag_prev and etag_new and etag_prev == etag_new:
+        return "não modificado (ETag)"
+    if lastmod_prev and lastmod_new and lastmod_prev == lastmod_new:
+        return "não modificado (Last-Modified)"
+
+    # 3) Baixa conteúdo
+    req_headers = {"User-Agent": "Mozilla/5.0 (StreamlitApp)"}
+    r = requests.get(url, timeout=60, allow_redirects=True, headers=req_headers)
+    r.raise_for_status()
+
+    first = r.content[:4]
+    if not _content_looks_excel(r.headers, first):
+        raise RuntimeError(
+            "O link não retornou um arquivo .xlsx (pode ser página de login do SharePoint). "
+            "Deixe o compartilhamento como 'Qualquer pessoa com o link – Visualizador' e use download=1."
+        )
+
+    destino.write_bytes(r.content)
+    meta.update({
+        "etag": etag_new,
+        "last_modified": lastmod_new,
+        "downloaded_at": datetime.now().isoformat(),
+        "source": url,
+        "size": len(r.content),
+    })
+    _save_meta(meta)
+    return "baixada por URL"
+
+def atualizar_por_metadados(DATA_URL: str, force: bool = False) -> tuple[bool, str]:
+    """Usa ETag/Last-Modified para decidir baixar. Se force=True, baixa sempre."""
     if not DATA_URL:
         return False, "Sem DATA_URL configurada."
     try:
-        if force or needs_daily_update(destino):
-            modo = baixar_fonte(DATA_URL, destino)
+        if force or not ARQUIVO.exists():
+            modo = download_if_changed(DATA_URL, ARQUIVO)
             return True, f"Base {modo}."
-        return False, "Base já está atualizada hoje."
+        # checagem por metadados: baixa se remoto mudou
+        modo = download_if_changed(DATA_URL, ARQUIVO)
+        if modo.startswith("não modificado"):
+            return False, "Base já está atualizada (metadados iguais)."
+        return True, f"Base {modo}."
     except Exception as e:
         return False, f"Falha ao atualizar: {e}"
+
+@st.cache_data(show_spinner=False, ttl=AUTO_CHECK_MINUTES*60)
+def auto_check_update(DATA_URL: str) -> tuple[bool, str]:
+    """Checagem automática com cache TTL para evitar chamadas excessivas."""
+    return atualizar_por_metadados(DATA_URL, force=False)
 
 def resolve_fonte_e_mtime(uploaded, destino: Path):
     if uploaded is not None:
@@ -291,17 +360,29 @@ st.markdown(BASE_CSS, unsafe_allow_html=True)
 if compact:
     st.markdown(COMPACT_CSS, unsafe_allow_html=True)
 
-# ============ ATUALIZAÇÃO DIÁRIA ============
+# ============ ATUALIZAÇÃO AUTOMÁTICA ============
 DATA_URL = get_data_url()
 
-# Na Cloud, preferimos sempre a DATA_URL. Se você enviar upload, ele tem prioridade
-# na sessão atual. Se não enviar, tento baixar (diariamente) a partir do SharePoint.
+# Checagem automática com TTL (roda ~1x por hora)
 if uploaded is None and DATA_URL:
-    atualizou, msg = atualizar_base_se_preciso(DATA_URL, force=False)
+    atualizou, msg = auto_check_update(DATA_URL)
     if atualizou:
-        st.toast("Base atualizada com sucesso.")
+        st.toast("Base atualizada automaticamente.")
 
-# Resolve fonte (upload > arquivo local baixado anteriormente)
+# Botão de forçar atualização
+with st.sidebar.expander("Atualização"):
+    if st.button("🔄 Atualizar agora", use_container_width=False):
+        ok, msg = atualizar_por_metadados(DATA_URL, force=True)
+        if ok:
+            st.cache_data.clear()
+            try:
+                st.rerun()
+            except Exception:
+                st.experimental_rerun()
+        else:
+            st.warning(msg)
+
+# Resolve fonte (upload > arquivo baixado)
 fonte_excel, last_update_dt, version_tag = resolve_fonte_e_mtime(uploaded, ARQUIVO)
 if fonte_excel is None:
     st.error("Não encontrei a base. Configure um DATA_URL válido (Settings → Secrets) ou envie um arquivo pelo upload.")
@@ -331,24 +412,11 @@ st.markdown(css_with_active_filter(st.session_state.pie_filter), unsafe_allow_ht
 col1, col2 = st.columns([2, 1])
 
 with col1:
-    # Última atualização + botão ao lado
-    ucol, bcol = st.columns([5, 2], gap="small")
-    with ucol:
-        st.markdown(
-            f'<div class="left-update">🕒 Última atualização: <strong>{format_dt(last_update_dt)}</strong></div>',
-            unsafe_allow_html=True,
-        )
-    with bcol:
-        if st.button("🔄 Atualizar agora", help="Rebaixa a planilha do SharePoint", width="stretch"):
-            ok, msg = atualizar_base_se_preciso(DATA_URL, force=True)
-            if ok:
-                st.cache_data.clear()
-                try:
-                    st.rerun()
-                except Exception:
-                    st.experimental_rerun()
-            else:
-                st.warning(msg)
+    # Última atualização (somente DATA)
+    st.markdown(
+        f'<div class="left-update">🕒 Última atualização: <strong>{format_dt_only_date(last_update_dt)}</strong></div>',
+        unsafe_allow_html=True,
+    )
 
     # Filtros
     concessoes = sorted(df["Concessao"].dropna().unique()) if "Concessao" in df.columns and df["Concessao"].notna().any() else []
@@ -356,7 +424,7 @@ with col1:
     f_conc = st.multiselect("Concessão", concessoes, default=concessoes)
     f_recurso = st.multiselect("Recurso", recursos, default=recursos)
 
-    # Aplicar filtros e possivel filtro do gráfico
+    # Aplicar filtros e possível filtro do gráfico
     df_f = df.copy()
     if st.session_state.pie_filter:
         df_f = df_f[df_f["Status MIX"].astype(str) == st.session_state.pie_filter]
